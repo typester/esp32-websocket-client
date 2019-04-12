@@ -1,0 +1,3 @@
+[submodule "wslay"]
+	path = wslay
+	url = git@github.com:tatsuhiro-t/wslay.git
