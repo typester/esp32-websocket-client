@@ -1,3 +1,6 @@
 [submodule "wslay"]
 	path = wslay
 	url = git@github.com:tatsuhiro-t/wslay.git
+[submodule "examples/echo-client/components/picohttpparser"]
+	path = examples/echo-client/components/picohttpparser
+	url = git@github.com:typester/esp32-picohttpparser.git

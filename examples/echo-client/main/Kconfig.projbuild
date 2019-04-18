@@ -1,0 +1,27 @@
+menu "Example Configuration"
+
+config SSID
+    string "WiFi SSID"
+    default "myssid"
+    help
+	SSID (network name) for the example to connect to.
+
+config PASS
+    string "WiFi Password"
+    default "mypassword"
+    help
+	WiFi password (WPA or WPA2) for the example to use.
+
+config WS_SERVER
+    string "WebSocket Server Hostname"
+    default "example.com"
+    help
+	Set websocket server hostname to connect
+
+config WS_PORT
+    int "WebSocket Server Port"
+    default 8080
+    help
+	Set websocket server port to connect
+
+endmenu
