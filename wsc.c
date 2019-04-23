@@ -132,6 +132,7 @@ wsc_err_code wsc_init(wsc_t *w)
 
     w->shutdown_queue = xQueueCreate(1, sizeof(int));
     w->send_queue = xQueueCreate(10, sizeof(wsc_msg_t));
+    w->recv_queue = xQueueCreate(1, sizeof(int));
     w->msg_callback = NULL;
 
     if (0 != wslay_event_context_client_init(&w->ctx, &w->cb, w)) {
@@ -156,6 +157,7 @@ void wsc_close(wsc_t *w)
     memset(&w->cb, 0, sizeof(w->cb));
     vQueueDelete(w->shutdown_queue);
     vQueueDelete(w->send_queue);
+    vQueueDelete(w->recv_queue);
 }
 
 wsc_headers_t *wsc_headers_new(size_t max_headers)
@@ -534,25 +536,45 @@ wsc_err_code wsc_send(wsc_t *wsc, wsc_msg_t *msg)
     return WSC_OK;
 }
 
-wsc_err_code wsc_run(wsc_t *wsc)
+static void wsc_select_task(void *p)
 {
+    wsc_t *w = (wsc_t *)p;
+
     struct timeval tv = {
         .tv_sec = 0,
         .tv_usec = 10000,
     };
     fd_set rfds;
 
-    while (wslay_event_want_read(wsc->ctx)) {
-        int fd = wsc->tls ? wsc->tls->sockfd : wsc->fd;
+    while (wslay_event_want_read(w->ctx)) {
+        int fd = w->tls ? w->tls->sockfd : w->fd;
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
         int s = select(fd + 1, &rfds, NULL, NULL, &tv);
+
         if (s < 0) {
             ESP_LOGE(TAG, "select failed");
-            return WSC_ERR_SELECT;
+            wsc_shutdown(w);
+            break;
         } else if (0 == s) {
             /* timeout */
         } else {
+            int available = 1;
+            xQueueSendToBack(w->recv_queue, &available, 0);
+        }
+    }
+
+    vTaskDelay(portMAX_DELAY); /* task will delete from main task*/
+}
+
+wsc_err_code wsc_run(wsc_t *wsc)
+{
+    TaskHandle_t hSelect;
+    xTaskCreate(wsc_select_task, "wsc-internal", 1024, wsc, 5, &hSelect);
+
+    while (wslay_event_want_read(wsc->ctx)) {
+        int available = 0;
+        if (xQueueReceive(wsc->recv_queue, &available, 0) && 1 == available) {
             int r = wslay_event_recv(wsc->ctx);
             if (0 != r) {
                 ESP_LOGE(TAG, "recv error: %d", r);
@@ -575,6 +597,8 @@ wsc_err_code wsc_run(wsc_t *wsc)
             }
         }
     }
+
+    vTaskDelete(hSelect);
 
     return WSC_OK;
 }

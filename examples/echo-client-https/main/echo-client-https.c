@@ -79,8 +79,7 @@ static void wsc_send_task(void *p)
     size_t counter = 0;
 
     while (true) {
-        counter = counter + 1;
-        ESP_LOGE(TAG, "counter=%d", counter);
+        counter++;
         snprintf(buf, 64, "hello %u", (uint32_t)counter);
 
         wsc_msg_t msg = {
@@ -91,8 +90,7 @@ static void wsc_send_task(void *p)
 
         wsc_send(w, &msg);
 
-        ESP_LOGE(TAG, "counter=%d done", counter);
-        vTaskDelay(200 * portTICK_PERIOD_MS);
+        vTaskDelay(3000 / portTICK_PERIOD_MS);
     }
 }
 

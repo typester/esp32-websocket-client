@@ -52,6 +52,7 @@ struct wsc_s {
     struct wslay_event_callbacks cb;
     QueueHandle_t shutdown_queue;
     QueueHandle_t send_queue;
+    QueueHandle_t recv_queue;
     wsc_msg_callback msg_callback;
 };
 
@@ -73,7 +74,7 @@ void wsc_headers_free(wsc_headers_t *headers);
 void wsc_headers_add(wsc_headers_t *headers, const char *key, const char *value);
 
 wsc_err_code wsc_connect(wsc_t *wsc, const char *host, uint16_t port, const char *path,
-                         wsc_headers_t *headers, esp_tls_cfg_t* tls_cfg);
+                         wsc_headers_t *headers, esp_tls_cfg_t *tls_cfg);
 
 wsc_err_code wsc_shutdown(wsc_t *wsc);
 wsc_err_code wsc_send(wsc_t *wsc, wsc_msg_t *msg);
