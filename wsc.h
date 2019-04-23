@@ -6,6 +6,7 @@
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
 #include "freertos/task.h"
+#include "esp_tls.h"
 
 typedef struct wsc_s wsc_t;
 typedef struct wsc_headers_s wsc_headers_t;
@@ -46,6 +47,7 @@ typedef enum {
 
 struct wsc_s {
     int fd;
+    esp_tls_t *tls;
     wslay_event_context_ptr ctx;
     struct wslay_event_callbacks cb;
     QueueHandle_t shutdown_queue;
@@ -71,7 +73,7 @@ void wsc_headers_free(wsc_headers_t *headers);
 void wsc_headers_add(wsc_headers_t *headers, const char *key, const char *value);
 
 wsc_err_code wsc_connect(wsc_t *wsc, const char *host, uint16_t port, const char *path,
-                         wsc_headers_t *headers);
+                         wsc_headers_t *headers, esp_tls_cfg_t* tls_cfg);
 
 wsc_err_code wsc_shutdown(wsc_t *wsc);
 wsc_err_code wsc_send(wsc_t *wsc, wsc_msg_t *msg);

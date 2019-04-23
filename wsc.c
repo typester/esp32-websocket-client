@@ -19,20 +19,47 @@ static const char *TAG = "wsc";
 
 static const char *WS_MAGICNUMBER = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
+static ssize_t wsc_recv_internal(wsc_t *w, uint8_t *buf, size_t len, int flags)
+{
+    if (NULL != w->tls) {
+        /* esp_tls or mbedtls doesn't have recv(2) interface */
+        return esp_tls_conn_read(w->tls, buf, len);
+    } else {
+        return recv(w->fd, buf, len, flags);
+    }
+}
+
+static ssize_t wsc_send_internal(wsc_t *w, const uint8_t *buf, size_t len, int flags)
+{
+    if (NULL != w->tls) {
+        return esp_tls_conn_write(w->tls, buf, len);
+    } else {
+        return send(w->fd, buf, len, flags);
+    }
+}
+
 static ssize_t recv_callback(wslay_event_context_ptr ctx, uint8_t *buf, size_t len, int flags,
                              void *user_data)
 {
     wsc_t *wsc = (wsc_t *)user_data;
     while (true) {
-        int r = recv(wsc->fd, buf, len, 0);
-        if (-1 == r) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                wslay_event_set_error(ctx, WSLAY_ERR_WOULDBLOCK);
+        int r = wsc_recv_internal(wsc, buf, len, flags);
+        if (r < 0) {
+            if (NULL != wsc->tls) {
+                if (r == MBEDTLS_ERR_SSL_WANT_READ) {
+                    wslay_event_set_error(ctx, WSLAY_ERR_WOULDBLOCK);
+                } else {
+                    wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
+                }
             } else {
-                wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    wslay_event_set_error(ctx, WSLAY_ERR_WOULDBLOCK);
+                } else {
+                    wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
+                }
             }
         } else if (0 == r) {
             wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
@@ -49,15 +76,23 @@ static ssize_t send_callback(wslay_event_context_ptr ctx, const uint8_t *data, s
 {
     wsc_t *wsc = (wsc_t *)user_data;
     while (true) {
-        int r = send(wsc->fd, data, len, flags);
-        if (-1 == r) {
-            if (errno == EINTR) {
-                continue;
-            }
-            if (errno == EAGAIN || errno == EWOULDBLOCK) {
-                wslay_event_set_error(ctx, WSLAY_ERR_WOULDBLOCK);
+        int r = wsc_send_internal(wsc, data, len, flags);
+        if (r < 0) {
+            if (NULL != wsc->tls) {
+                if (r == MBEDTLS_ERR_SSL_WANT_WRITE || r == MBEDTLS_ERR_SSL_WANT_READ) {
+                    wslay_event_set_error(ctx, WSLAY_ERR_WOULDBLOCK);
+                } else {
+                    wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
+                }
             } else {
-                wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
+                if (errno == EINTR) {
+                    continue;
+                }
+                if (errno == EAGAIN || errno == EWOULDBLOCK) {
+                    wslay_event_set_error(ctx, WSLAY_ERR_WOULDBLOCK);
+                } else {
+                    wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
+                }
             }
         } else if (0 == r) {
             wslay_event_set_error(ctx, WSLAY_ERR_CALLBACK_FAILURE);
@@ -93,6 +128,7 @@ wsc_err_code wsc_init(wsc_t *w)
     w->cb.on_msg_recv_callback = msg_callback;
 
     w->fd = -1;
+    w->tls = NULL;
 
     w->shutdown_queue = xQueueCreate(1, sizeof(int));
     w->send_queue = xQueueCreate(10, sizeof(wsc_msg_t));
@@ -112,6 +148,10 @@ void wsc_close(wsc_t *w)
         shutdown(w->fd, SHUT_WR);
         close(w->fd);
         w->fd = -1;
+    }
+    if (NULL != w->tls) {
+        esp_tls_conn_delete(w->tls);
+        w->tls = NULL;
     }
     memset(&w->cb, 0, sizeof(w->cb));
     vQueueDelete(w->shutdown_queue);
@@ -172,11 +212,11 @@ static wsc_err_code create_accept_key(const char *client_id, char *buf, size_t b
     return WSC_OK;
 }
 
-static int handshake_write(int fd, const char *buf, size_t len)
+static int handshake_write(wsc_t *w, const char *buf, size_t len)
 {
     size_t off = 0;
     while (off < len) {
-        ssize_t r = write(fd, buf + off, len - off);
+        ssize_t r = wsc_send_internal(w, (const uint8_t *)buf + off, len - off, 0);
         if (-1 == r) {
             if (errno == EINTR) {
                 continue;
@@ -189,7 +229,7 @@ static int handshake_write(int fd, const char *buf, size_t len)
     return off;
 }
 
-static ssize_t handshake_read(int fd, char *buf, size_t buf_len, const char *client_key)
+static ssize_t handshake_read(wsc_t *w, char *buf, size_t buf_len, const char *client_key)
 {
     struct timeval tv = {
         .tv_sec = 10,
@@ -210,6 +250,8 @@ static ssize_t handshake_read(int fd, char *buf, size_t buf_len, const char *cli
             return -WSC_ERR_HANDSHAKE_RESPONSE_TOO_LONG;
         }
 
+        int fd = NULL != w->tls ? w->tls->sockfd : w->fd;
+
         FD_ZERO(&rfds);
         FD_SET(fd, &rfds);
         int s = select(fd + 1, &rfds, NULL, NULL, &tv);
@@ -220,7 +262,7 @@ static ssize_t handshake_read(int fd, char *buf, size_t buf_len, const char *cli
             ESP_LOGE(TAG, "handshake timeout");
             return -WSC_ERR_HANDSHAKE_TIMEOUT;
         } else {
-            ssize_t r = read(fd, buf + off, len - off);
+            ssize_t r = wsc_recv_internal(w, (uint8_t *)buf + off, len, 0);
             if (-1 == r) {
                 if (errno == EINTR) {
                     continue;
@@ -328,7 +370,7 @@ static wsc_err_code wsc_handshake(wsc_t *wsc, const char *host, uint16_t port, c
     }
 
     int r;
-    if (80 == port) {
+    if ((NULL == wsc->tls && 80 == port) || (NULL != wsc->tls && 443 == port)) {
         r = snprintf(req, req_len,
                      "GET %s HTTP/1.1\r\n"
                      "Host: %s\r\n"
@@ -355,13 +397,13 @@ static wsc_err_code wsc_handshake(wsc_t *wsc, const char *host, uint16_t port, c
     }
     r += snprintf(req + r, req_len - r, "\r\n");
 
-    if (-1 == handshake_write(wsc->fd, req, r)) {
+    if (-1 == handshake_write(wsc, req, r)) {
         free(req);
         return WSC_ERR_HANDSHAKE_WRITE;
     }
 
     char res[512];
-    size_t res_len = handshake_read(wsc->fd, res, 512, client_id);
+    size_t res_len = handshake_read(wsc, res, 512, client_id);
     if (res_len <= 0) {
         free(req);
         return -res_len; /* handshake_read return wsc_err_code as negative value */
@@ -399,63 +441,74 @@ static int make_non_block(int fd)
 }
 
 wsc_err_code wsc_connect(wsc_t *wsc, const char *host, uint16_t port, const char *path,
-                         wsc_headers_t *headers)
+                         wsc_headers_t *headers, esp_tls_cfg_t *tls_cfg)
 {
-
-    const struct addrinfo hints = {
-        .ai_family = AF_UNSPEC,
-        .ai_socktype = SOCK_STREAM,
-    };
-    struct addrinfo *res;
-    char addr_str[46];
     wsc_err_code err;
 
-    ESP_LOGD(TAG, "getaddrinfo: %s", host);
-    int r = getaddrinfo(host, NULL, &hints, &res);
-    if (0 != r) {
-        ESP_LOGE(TAG, "getaddrinfo error: %d", errno);
-        return WSC_ERR_HANDSHAKE_ADDRINFO;
-    }
-    if (NULL == res) {
-        ESP_LOGE(TAG, "getaddrinfo failed: cannot found address");
-        return WSC_ERR_HANDSHAKE_NO_ADDRESS;
-    }
+    if (NULL != tls_cfg) {
+        /* force nonblock */
+        tls_cfg->non_block = true;
 
-    if (res->ai_family == AF_INET) {
-        ((struct sockaddr_in *)res->ai_addr)->sin_port = htons(port);
-        struct in_addr *addr = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
-        inet_ntoa_r(*addr, addr_str, sizeof(addr_str) - 1);
-        ESP_LOGD(TAG, "DNS lookup succeeded: IP=%s", addr_str);
+        wsc->tls = esp_tls_conn_new(host, strlen(host), port, tls_cfg);
+        if (NULL == wsc->tls) {
+            ESP_LOGE(TAG, "failed to create tls connection to server");
+            return WSC_ERR_CONNECT;
+        }
     } else {
-        ((struct sockaddr_in6 *)res->ai_addr)->sin6_port = htons(port);
-        struct in6_addr *addr = &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr;
-        ESP_LOGD(TAG, "DNS lookup succeeded: IP=%s", inet6_ntoa(*addr));
-    }
+        const struct addrinfo hints = {
+            .ai_family = AF_UNSPEC,
+            .ai_socktype = SOCK_STREAM,
+        };
+        struct addrinfo *res;
+        char addr_str[46];
 
-    wsc->fd = socket(res->ai_family, res->ai_socktype, 0);
-    if (-1 == wsc->fd) {
-        ESP_LOGE(TAG, "failed to create socket: %d", errno);
-        freeaddrinfo(res);
-        return WSC_ERR_CREATE_SOCKET;
-    }
+        ESP_LOGD(TAG, "getaddrinfo: %s", host);
+        int r = getaddrinfo(host, NULL, &hints, &res);
+        if (0 != r) {
+            ESP_LOGE(TAG, "getaddrinfo error: %d", errno);
+            return WSC_ERR_HANDSHAKE_ADDRINFO;
+        }
+        if (NULL == res) {
+            ESP_LOGE(TAG, "getaddrinfo failed: cannot found address");
+            return WSC_ERR_HANDSHAKE_NO_ADDRESS;
+        }
 
-    r = connect(wsc->fd, res->ai_addr, res->ai_addrlen);
-    if (-1 == r) {
-        ESP_LOGE(TAG, "connection failed: %d", errno);
+        if (res->ai_family == AF_INET) {
+            ((struct sockaddr_in *)res->ai_addr)->sin_port = htons(port);
+            struct in_addr *addr = &((struct sockaddr_in *)res->ai_addr)->sin_addr;
+            inet_ntoa_r(*addr, addr_str, sizeof(addr_str) - 1);
+            ESP_LOGD(TAG, "DNS lookup succeeded: IP=%s", addr_str);
+        } else {
+            ((struct sockaddr_in6 *)res->ai_addr)->sin6_port = htons(port);
+            struct in6_addr *addr = &((struct sockaddr_in6 *)res->ai_addr)->sin6_addr;
+            ESP_LOGD(TAG, "DNS lookup succeeded: IP=%s", inet6_ntoa(*addr));
+        }
+
+        wsc->fd = socket(res->ai_family, res->ai_socktype, 0);
+        if (-1 == wsc->fd) {
+            ESP_LOGE(TAG, "failed to create socket: %d", errno);
+            freeaddrinfo(res);
+            return WSC_ERR_CREATE_SOCKET;
+        }
+
+        r = connect(wsc->fd, res->ai_addr, res->ai_addrlen);
+        if (-1 == r) {
+            ESP_LOGE(TAG, "connection failed: %d", errno);
+            freeaddrinfo(res);
+            return WSC_ERR_CONNECT;
+        }
+
         freeaddrinfo(res);
-        return WSC_ERR_CONNECT;
     }
 
     err = wsc_handshake(wsc, host, port, path, headers);
     if (WSC_OK != err) {
         ESP_LOGE(TAG, "handshake failed: %d", err);
-        freeaddrinfo(res);
         return err;
     }
     ESP_LOGD(TAG, "connection succeeded");
-    freeaddrinfo(res);
 
-    if (-1 == make_non_block(wsc->fd)) {
+    if (NULL == wsc->tls && -1 == make_non_block(wsc->fd)) {
         ESP_LOGE(TAG, "failed to make socket to unblocking mode");
         return WSC_ERR_SET_SOCKETOPT;
     }
@@ -490,9 +543,10 @@ wsc_err_code wsc_run(wsc_t *wsc)
     fd_set rfds;
 
     while (wslay_event_want_read(wsc->ctx)) {
+        int fd = wsc->tls ? wsc->tls->sockfd : wsc->fd;
         FD_ZERO(&rfds);
-        FD_SET(wsc->fd, &rfds);
-        int s = select(wsc->fd + 1, &rfds, NULL, NULL, &tv);
+        FD_SET(fd, &rfds);
+        int s = select(fd + 1, &rfds, NULL, NULL, &tv);
         if (s < 0) {
             ESP_LOGE(TAG, "select failed");
             return WSC_ERR_SELECT;

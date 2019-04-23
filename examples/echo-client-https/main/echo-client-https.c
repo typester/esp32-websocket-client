@@ -1,9 +1,10 @@
-#include <string.h>
 #include <assert.h>
+#include <string.h>
 
 #include "freertos/FreeRTOS.h"
 #include "freertos/event_groups.h"
 #include "freertos/task.h"
+
 #include "esp_system.h"
 #include "esp_event_loop.h"
 #include "esp_log.h"
@@ -17,19 +18,20 @@
 #include "lwip/sys.h"
 #include "lwip/netdb.h"
 
-#include "sdkconfig.h"
-
 /* config */
+#include "sdkconfig.h"
 #define EXAMPLE_SSID CONFIG_SSID
 #define EXAMPLE_PASS CONFIG_PASS
 #define EXAMPLE_WS_SERVER CONFIG_WS_SERVER
 #define EXAMPLE_WS_PORT CONFIG_WS_PORT
 
-static const char *TAG = "echo-client";
+static const char *TAG = "echo-client-https";
+
+extern const uint8_t server_pem_start[] asm("_binary_server_pem_start");
+extern const uint8_t server_pem_end[] asm("_binary_server_pem_end");
 
 static EventGroupHandle_t s_wifi_event_group;
 static const int CONNECTED_BIT = BIT0;
-static const int CONNECTED6_BIT = BIT1;
 
 static esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
 {
@@ -55,73 +57,82 @@ static esp_err_t wifi_event_handler(void *ctx, system_event_t *event)
         if (0 == memcmp(&event->event_info.got_ip6.ip6_info.ip, &addr, sizeof(ip6_addr_t))) {
             ESP_LOGW(TAG, "but it is created by me");
         } else {
-            xEventGroupSetBits(s_wifi_event_group, CONNECTED6_BIT);
+            xEventGroupSetBits(s_wifi_event_group, CONNECTED_BIT);
         }
         break;
     }
     case SYSTEM_EVENT_STA_DISCONNECTED:
         xEventGroupClearBits(s_wifi_event_group, CONNECTED_BIT);
-        xEventGroupClearBits(s_wifi_event_group, CONNECTED6_BIT);
         esp_wifi_connect();
         break;
     default:
         break;
     }
-
     return ESP_OK;
+    ;
+}
+
+static void wsc_send_task(void *p)
+{
+    wsc_t *w = (wsc_t *)p;
+    char buf[64];
+    size_t counter = 0;
+
+    while (true) {
+        counter = counter + 1;
+        ESP_LOGE(TAG, "counter=%d", counter);
+        snprintf(buf, 64, "hello %u", (uint32_t)counter);
+
+        wsc_msg_t msg = {
+            .opcode = 2,
+            .msg = (const unsigned char *)strdup(buf),
+            .msg_length = strlen(buf),
+        };
+
+        wsc_send(w, &msg);
+
+        ESP_LOGE(TAG, "counter=%d done", counter);
+        vTaskDelay(200 * portTICK_PERIOD_MS);
+    }
 }
 
 static void msg_callback(wsc_t *wsc, const struct wslay_event_on_msg_recv_arg *msg)
 {
     ESP_LOGW(TAG, "got msg opcode=%d", msg->opcode);
     ESP_LOG_BUFFER_HEXDUMP(TAG, msg->msg, msg->msg_length, ESP_LOG_WARN);
-
-    /* echo back to server */
-    uint8_t *echo_msg = NULL;
-    if (msg->msg_length > 0) {
-        if (0 == strncmp((const char *)msg->msg, "close", msg->msg_length)) {
-            ESP_LOGI(TAG, "shutdown message received. closing connection");
-            wsc_shutdown(wsc);
-            return;
-        }
-
-        echo_msg = malloc(msg->msg_length);
-        assert(NULL != echo_msg);
-        memcpy(echo_msg, msg->msg, msg->msg_length);
-    }
-
-    wsc_msg_t echo = {0x02, echo_msg, msg->msg_length};
-    wsc_send(wsc, &echo);
 }
 
 static void wsc_task()
 {
-    xEventGroupWaitBits(s_wifi_event_group, CONNECTED_BIT | CONNECTED6_BIT, false, false,
-                        portMAX_DELAY);
+    ESP_LOGI(TAG, "wsc_task started");
+
+    /* waiting network available */
+    xEventGroupWaitBits(s_wifi_event_group, CONNECTED_BIT, false, true, portMAX_DELAY);
 
     wsc_err_code err;
     wsc_t wsc;
 
     err = wsc_init(&wsc);
-    if (WSC_OK != err) {
-        ESP_LOGE(TAG, "failed to init wsc");
-        vTaskDelete(NULL);
-        return;
-    }
+    assert(err == WSC_OK);
     wsc.msg_callback = msg_callback;
 
-    wsc_headers_t *headers = wsc_headers_new(2);
-    wsc_headers_add(headers, "User-Agent", "esp32-echo-client");
-    wsc_headers_add(headers, "X-Foo", "bar!");
+    esp_tls_cfg_t tls_cfg = {
+        .timeout_ms = 10 * 1000,
+        .cacert_pem_buf = server_pem_start,
+        .cacert_pem_bytes = server_pem_end - server_pem_start,
+    };
+    err = wsc_connect(&wsc, EXAMPLE_WS_SERVER, EXAMPLE_WS_PORT, "/", NULL, &tls_cfg);
 
-    err = wsc_connect(&wsc, EXAMPLE_WS_SERVER, EXAMPLE_WS_PORT, "/stream", headers, NULL);
-    wsc_headers_free(headers);
     if (WSC_OK != err) {
         ESP_LOGE(TAG, "failed to connect: %d", err);
         wsc_close(&wsc);
         vTaskDelete(NULL);
-        return;
     }
+    ESP_LOGI(TAG, "tls connection success");
+
+    /* start  */
+    TaskHandle_t send_task;
+    xTaskCreate(wsc_send_task, "wsc_send", (1024 * 2), &wsc, 5, &send_task);
 
     err = wsc_run(&wsc);
     if (ESP_OK != err) {
@@ -131,6 +142,7 @@ static void wsc_task()
         return;
     }
 
+    vTaskDelete(send_task);
     wsc_close(&wsc);
 
     ESP_LOGI(TAG, "wsc_task done");
@@ -140,11 +152,13 @@ static void wsc_task()
 
 void app_main()
 {
+    /* initialize nvs */
     esp_err_t err = nvs_flash_init();
     if (err == ESP_ERR_NVS_PAGE_FULL || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
         ESP_ERROR_CHECK(nvs_flash_init());
     }
+    ESP_ERROR_CHECK(err);
 
     s_wifi_event_group = xEventGroupCreate();
     tcpip_adapter_init();
