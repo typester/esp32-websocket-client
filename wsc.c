@@ -598,6 +598,8 @@ wsc_err_code wsc_run(wsc_t *wsc)
                 free((uint8_t *)msg.msg);
             }
         }
+
+        vTaskDelay(1); /* fot task watchdog */
     }
 
     vTaskDelete(hSelect);
