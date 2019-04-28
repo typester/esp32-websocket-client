@@ -283,6 +283,8 @@ static ssize_t handshake_read(wsc_t *w, char *buf, size_t buf_len, const char *c
             off += r;
             buf[off] = 0;
 
+            ESP_LOGD(TAG, "response: %s", buf);
+
             if (-1 == pret) {
                 ESP_LOGE(TAG, "handshake_read error: invalid response");
                 return -WSC_ERR_HANDSHAKE_INVALID_RESPONSE;
@@ -297,13 +299,13 @@ static ssize_t handshake_read(wsc_t *w, char *buf, size_t buf_len, const char *c
                 for (int i = 0; i < num_headers; i++) {
                     if (0 == strncasecmp(headers[i].name, "Upgrade", headers[i].name_len)) {
                         if (headers[i].value_len > 0 &&
-                            0 == strncmp(headers[i].value, "websocket", headers[i].value_len)) {
+                            0 == strncasecmp(headers[i].value, "websocket", headers[i].value_len)) {
                             upgrade_ok[0] = true;
                         }
                     } else if (0 ==
                                strncasecmp(headers[i].name, "Connection", headers[i].name_len)) {
                         if (headers[i].value_len > 0 &&
-                            0 == strncmp(headers[i].value, "Upgrade", headers[i].value_len)) {
+                            0 == strncasecmp(headers[i].value, "upgrade", headers[i].value_len)) {
                             upgrade_ok[1] = true;
                         }
                     } else if (0 == strncasecmp(headers[i].name, "Sec-WebSocket-Accept",
@@ -405,7 +407,7 @@ static wsc_err_code wsc_handshake(wsc_t *wsc, const char *host, uint16_t port, c
     }
 
     char res[512];
-    size_t res_len = handshake_read(wsc, res, 512, client_id);
+    ssize_t res_len = handshake_read(wsc, res, 512, client_id);
     if (res_len <= 0) {
         free(req);
         return -res_len; /* handshake_read return wsc_err_code as negative value */
