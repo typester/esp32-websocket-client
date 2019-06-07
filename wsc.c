@@ -574,13 +574,15 @@ wsc_err_code wsc_run(wsc_t *wsc)
     TaskHandle_t hSelect;
     xTaskCreate(wsc_select_task, "wsc-internal", 1024, wsc, 5, &hSelect);
 
+    wsc_err_code err = WSC_OK;
+
     while (wslay_event_want_read(wsc->ctx)) {
         int available = 0;
         if (xQueueReceive(wsc->recv_queue, &available, 0) && 1 == available) {
             int r = wslay_event_recv(wsc->ctx);
             if (0 != r) {
                 ESP_LOGE(TAG, "recv error: %d", r);
-                return WSC_ERR_RECV;
+                err = WSC_ERR_RECV;
             }
         }
 
@@ -604,5 +606,5 @@ wsc_err_code wsc_run(wsc_t *wsc)
 
     vTaskDelete(hSelect);
 
-    return WSC_OK;
+    return err;
 }
